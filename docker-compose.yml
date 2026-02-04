@@ -1,0 +1,49 @@
+version: '3.8'
+
+services:
+  watcher:
+    build: .
+    container_name: virtuals-launch-watcher
+    restart: unless-stopped
+    
+    volumes:
+      # 配置文件（只读）
+      - ./config.yaml:/app/config.yaml:ro
+      # 数据目录（可选 SQLite）
+      - ./data:/app/data
+    
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - NODE_ENV=production
+      - HEALTH_PORT=3000
+    
+    ports:
+      - "3000:3000"
+    
+    # 健康检查
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # 可选：监控面板
+  # grafana:
+  #   image: grafana/grafana:latest
+  #   ports:
+  #     - "3001:3000"
+  #   volumes:
+  #     - grafana-data:/var/lib/grafana
+  #   depends_on:
+  #     - watcher
+
+# volumes:
+#   grafana-data:

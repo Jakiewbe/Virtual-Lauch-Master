@@ -1,0 +1,40 @@
+# Virtuals Launch Watcher 配置文件
+# 复制此文件为 config.yaml 并填入实际值
+
+chain:
+  name: base
+  chainId: 8453
+  rpc:
+    http:
+      - https://mainnet.base.org
+      - https://base.llamarpc.com
+      - https://base.drpc.org
+      - https://base-mainnet.public.blastapi.io
+    wss:
+      - wss://base.publicnode.com
+      - wss://base.gateway.tenderly.co
+
+virtuals:
+  apiBase: https://api.virtuals.io
+  pollIntervalMs: 5000
+  maxProjectAgeMinutes: 10
+
+addresses:
+  buybackAddr: "0x32487287c65f11d53bbCa89c2472171eB09bf337"
+  virtualToken: "0x0b3e328455c4059EEb9e3f84b5543F74E24e7E1b"
+
+thresholds:
+  bigTradeVirtual: 1000
+  taxWindowMinutes: 100
+  buybackRateWindowMinutes: 20
+  stallAlertMinutes: 5
+
+telegram:
+  botToken: ${TELEGRAM_BOT_TOKEN}
+  chatId: ${TELEGRAM_CHAT_ID}
+
+logging:
+  level: info    # debug | info | warn | error
+
+# 健康检查端口（可选）
+# healthPort: 3000
