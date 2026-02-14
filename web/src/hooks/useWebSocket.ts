@@ -4,7 +4,7 @@
  */
 
 import { useEffect, useRef, useState, useCallback } from 'react';
-import type { ApiEvent, ApiState } from './types';
+import type { ApiEvent, ApiState } from '../types';
 
 interface UseWebSocketResult {
     isConnected: boolean;
@@ -22,9 +22,10 @@ export function useWebSocket(): UseWebSocketResult {
 
     const connect = useCallback(() => {
         // 确定 WebSocket URL
+        const envWsUrl = import.meta.env.VITE_WS_URL as string | undefined;
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const host = window.location.host;
-        const wsUrl = `${protocol}//${host}`;
+        const wsUrl = envWsUrl || `${protocol}//${host}/ws`;
 
         try {
             const ws = new WebSocket(wsUrl);

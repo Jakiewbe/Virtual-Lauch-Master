@@ -28,7 +28,7 @@ export interface Config {
         buybackRateWindowMinutes: number;
         stallAlertMinutes: number;
     };
-    telegram: {
+    telegram?: {
         botToken: string;
         chatId: string;
     };
@@ -113,6 +113,7 @@ export interface StateMachineContext {
     t0: Date | null;
     t1: Date | null;
     taxTotal: bigint;
+    startBalance: bigint | null;
     lastTaxUpdate: Date | null;
     lastBuybackUpdate: Date | null;
 }
@@ -136,6 +137,7 @@ export interface BuybackStatus {
     remaining: bigint;
     etaHours: number;
     progress: number;
+    lastTxAmount: bigint | null;
 }
 
 export interface SpentRecord {

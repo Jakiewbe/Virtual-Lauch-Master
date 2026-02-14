@@ -40,12 +40,15 @@ export const UNISWAP_V2_FACTORY_ABI = [
     'function allPairsLength() view returns (uint)',
 ] as const;
 
-// Virtuals Curve Pool ABI (简化版)
+// Virtuals Curve Pool ABI (简化版，含备用方法名)
 export const VIRTUALS_CURVE_ABI = [
     'event Trade(address indexed trader, uint256 amountIn, uint256 amountOut, bool isBuy)',
     'function buy(uint256 tokenAmount) payable',
     'function sell(uint256 tokenAmount)',
     'function getTokenPrice() view returns (uint256)',
+    'function getPrice() view returns (uint256)',
+    'function token() view returns (address)',
+    'function agentToken() view returns (address)',
 ] as const;
 
 // 常用地址

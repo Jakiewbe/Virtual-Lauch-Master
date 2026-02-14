@@ -2,7 +2,7 @@
  * API 调用封装
  */
 
-import type { ApiState, Trade, ApiEvent, RpcHealth, Config } from './types';
+import type { ApiState, Trade, ApiEvent, RpcHealth, Config, UpcomingLaunch } from './types';
 
 const API_BASE = '/api';
 
@@ -32,4 +32,8 @@ export async function getHealth(): Promise<RpcHealth> {
 
 export async function getConfig(): Promise<Config> {
     return fetchJson<Config>('/config');
+}
+
+export async function getUpcomingLaunches(): Promise<UpcomingLaunch[]> {
+    return fetchJson<UpcomingLaunch[]>('/upcoming-launches');
 }

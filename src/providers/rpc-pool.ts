@@ -91,7 +91,7 @@ export class RpcPool {
         const url = this.wssUrls[index];
         try {
             const provider = new ethers.WebSocketProvider(url);
-            await withTimeout(provider.ready, 10000, 'WSS connection timeout');
+            await withTimeout(provider.getNetwork(), 10000, 'WSS connection timeout');
             this.wssProviders.set(index, provider);
             logger.info('WSS provider connected', { url });
             return provider;

@@ -18,8 +18,13 @@ export interface ApiState {
     t0: string | null;
     t1: string | null;
     taxTotal: string;
+    startBalance?: string | null;
     elapsedMinutes: number;
     remainingMinutes: number;
+    onchainFdvVirtual?: string | null;
+    onchainFdvUsd?: string | null;
+    apiFdvVirtual?: string | null;
+    apiFdvUsd?: string | null;
     tax: {
         netInflow: string;
         balanceDiff: string;
@@ -28,6 +33,8 @@ export interface ApiState {
         spentTotal: string;
         progress: number;
         etaHours: number;
+        ratePerHour?: number;
+        lastTxAmount?: string | null;
     } | null;
 }
 
@@ -70,4 +77,19 @@ export interface Config {
         buybackRateWindowMinutes: number;
         stallAlertMinutes: number;
     };
+}
+
+export interface UpcomingLaunch {
+    id: number;
+    name: string;
+    symbol: string;
+    status: 'INITIALIZED' | 'UNDERGRAD' | 'AVAILABLE';
+    factory: 'VIBES_BONDING_V2' | 'BONDING_V4' | string;
+    source: '60_days' | 'unicorn';
+    createdAt: string;
+    launchedAt: string | null;
+    preTokenPair: string | null;
+    image?: { url: string };
+    mcapInVirtual?: number;
+    liquidityUsd?: number;
 }

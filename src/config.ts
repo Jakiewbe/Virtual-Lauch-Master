@@ -39,17 +39,19 @@ const DEFAULT_CONFIG: Partial<Config> = {
     },
 };
 
+const OPTIONAL_ENV_VARS = new Set(['TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID']);
+
 /**
  * 替换字符串中的环境变量占位符
- * 格式: ${ENV_VAR_NAME}
+ * 格式: ${ENV_VAR_NAME}，OPTIONAL_ENV_VARS 未设置时替换为空字符串
  */
 function replaceEnvVars(value: string): string {
     return value.replace(/\$\{(\w+)\}/g, (_, envVar) => {
         const envValue = process.env[envVar];
-        if (!envValue) {
+        if (!envValue && !OPTIONAL_ENV_VARS.has(envVar)) {
             throw new Error(`Environment variable ${envVar} is not set`);
         }
-        return envValue;
+        return envValue || '';
     });
 }
 
@@ -142,8 +144,6 @@ function validateConfig(config: Config): void {
         ['virtuals.apiBase', config.virtuals?.apiBase],
         ['addresses.buybackAddr', config.addresses?.buybackAddr],
         ['addresses.virtualToken', config.addresses?.virtualToken],
-        ['telegram.botToken', config.telegram?.botToken],
-        ['telegram.chatId', config.telegram?.chatId],
     ];
 
     for (const [path, value] of required) {

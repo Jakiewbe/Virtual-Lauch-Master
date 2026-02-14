@@ -5,7 +5,11 @@
 
 import { logger, sleep, ApiError, withRetry, withTimeout } from '../utils/index.js';
 import { getConfig } from '../config.js';
-import type { VirtualsAgent, VirtualsApiResponse, SelectedProject } from '../types.js';
+import type { VirtualsAgent, VirtualsApiResponse, SelectedProject, FactoryType } from '../types.js';
+
+function getTaxWindowMs(): number {
+    return getConfig().thresholds.taxWindowMinutes * 60 * 1000;
+}
 
 const REQUEST_TIMEOUT_MS = 10000;
 
@@ -13,6 +17,10 @@ export class VirtualsApi {
     private baseUrl: string;
     private pollInterval: number;
     private maxProjectAge: number;
+    private readonly discoveryPage = 1;
+    private readonly discoveryPageSize = 200;
+    private upcomingCache: { ts: number; data: VirtualsAgent[] } | null = null;
+    private upcomingInFlight: Promise<VirtualsAgent[]> | null = null;
 
     constructor() {
         const config = getConfig();
@@ -68,21 +76,31 @@ export class VirtualsApi {
     }
 
     /**
-     * 获取项目列表（按 LP 创建时间倒序）
+     * 获取项目列表（按创建时间倒序）
      */
-    async getLatestProjects(pageSize: number = 20): Promise<VirtualsAgent[]> {
-        const path = `/api/virtuals?sort[0]=lpCreatedAt:desc&pagination[pageSize]=${pageSize}`;
+    async getLatestProjects(page: number = 1, pageSize: number = this.discoveryPageSize): Promise<VirtualsAgent[]> {
+        return this.getProjectsBySort('createdAt:desc', page, pageSize);
+    }
 
+    async getProjectsBySort(
+        sort: 'createdAt:desc' | 'lpCreatedAt:desc' | 'launchedAt:desc',
+        page: number,
+        pageSize: number
+    ): Promise<VirtualsAgent[]> {
+        const path = this.buildProjectsQuery({ sort, page, pageSize });
         try {
             const response = await this.request<VirtualsApiResponse<VirtualsAgent>>(path);
-
             logger.debug('Fetched projects from API', {
+                sort,
                 count: response.data.length,
                 total: response.meta.pagination.total,
             });
-
             return response.data;
         } catch (error) {
+            if (sort !== 'createdAt:desc') {
+                logger.debug('Fallback sort failed', { sort, error: String(error) });
+                return [];
+            }
             logger.logError('Failed to fetch projects', error);
             throw error;
         }
@@ -91,8 +109,12 @@ export class VirtualsApi {
     /**
      * 按创建时间获取最新项目
      */
-    async getNewestProjects(pageSize: number = 20): Promise<VirtualsAgent[]> {
-        const path = `/api/virtuals?sort[0]=createdAt:desc&pagination[pageSize]=${pageSize}`;
+    async getNewestProjects(page: number = 1, pageSize: number = this.discoveryPageSize): Promise<VirtualsAgent[]> {
+        const path = this.buildProjectsQuery({
+            sort: 'createdAt:desc',
+            page,
+            pageSize,
+        });
         const response = await this.request<VirtualsApiResponse<VirtualsAgent>>(path);
         return response.data;
     }
@@ -100,10 +122,129 @@ export class VirtualsApi {
     /**
      * 获取 60 Days 项目
      */
-    async getVibesProjects(pageSize: number = 20): Promise<VirtualsAgent[]> {
-        const path = `/api/virtuals?filters[factory][$eq]=VIBES_BONDING_V2&pagination[pageSize]=${pageSize}`;
+    async getVibesProjects(page: number = 1, pageSize: number = this.discoveryPageSize): Promise<VirtualsAgent[]> {
+        const path = this.buildProjectsQuery({
+            sort: 'createdAt:desc',
+            page,
+            pageSize,
+            factory: 'VIBES_BONDING_V2',
+        });
         const response = await this.request<VirtualsApiResponse<VirtualsAgent>>(path);
         return response.data;
+    }
+
+    async getProjectsByFactory(
+        factory: FactoryType,
+        page: number = 1,
+        pageSize: number = this.discoveryPageSize
+    ): Promise<VirtualsAgent[]> {
+        const path = this.buildProjectsQuery({
+            sort: 'createdAt:desc',
+            page,
+            pageSize,
+            factory,
+        });
+        const response = await this.request<VirtualsApiResponse<VirtualsAgent>>(path);
+        return response.data;
+    }
+
+    private async getAllProjectsByFactory(factory: FactoryType, pageSize: number = 100): Promise<VirtualsAgent[]> {
+        let page = 1;
+        let pageCount = 1;
+        const all: VirtualsAgent[] = [];
+
+        do {
+            const path = this.buildProjectsQuery({
+                sort: 'createdAt:desc',
+                page,
+                pageSize,
+                factory,
+            });
+            const response = await this.request<VirtualsApiResponse<VirtualsAgent>>(path);
+            all.push(...response.data);
+            pageCount = response.meta.pagination.pageCount;
+            page++;
+        } while (page <= pageCount);
+
+        return all;
+    }
+
+    async getUpcomingLaunches(pageSize: number = 100): Promise<VirtualsAgent[]> {
+        const now = Date.now();
+        const cacheTtlMs = 30_000;
+        if (this.upcomingCache && now - this.upcomingCache.ts < cacheTtlMs) {
+            return this.upcomingCache.data;
+        }
+        if (this.upcomingInFlight) {
+            return this.upcomingInFlight;
+        }
+
+        this.upcomingInFlight = (async () => {
+            const [vibes, unicorn, unicornV2] = await Promise.all([
+                this.getAllProjectsByFactory('VIBES_BONDING_V2', pageSize),
+                this.getAllProjectsByFactory('BONDING_V4', pageSize),
+                this.getAllProjectsByFactory('BONDING_V2', pageSize),
+            ]);
+            const merged = [...vibes, ...unicorn, ...unicornV2];
+            const deduped = new Map<number, VirtualsAgent>();
+            for (const agent of merged) {
+                deduped.set(agent.id, agent);
+            }
+
+            const result = [...deduped.values()]
+                .filter((agent) =>
+                    agent.status === 'INITIALIZED' &&
+                    Boolean(agent.preTokenPair) &&
+                    !agent.lpCreatedAt
+                )
+                .filter((agent) => {
+                    const launchTs = this.parseTimestamp(agent.launchedAt);
+                    if (launchTs === null) {
+                        return false;
+                    }
+                    const nowTs = Date.now();
+                    const maxTs = nowTs + 10 * 24 * 60 * 60 * 1000;
+                    return launchTs >= nowTs && launchTs <= maxTs;
+                })
+                .sort((a, b) => {
+                    const at = this.parseTimestamp(a.launchedAt) ?? 0;
+                    const bt = this.parseTimestamp(b.launchedAt) ?? 0;
+                    return at - bt;
+                });
+
+            this.upcomingCache = { ts: Date.now(), data: result };
+            return result;
+        })();
+
+        try {
+            return await this.upcomingInFlight;
+        } finally {
+            this.upcomingInFlight = null;
+        }
+    }
+
+    private buildProjectsQuery(params: {
+        sort: 'createdAt:desc' | 'lpCreatedAt:desc' | 'launchedAt:desc';
+        page: number;
+        pageSize: number;
+        factory?: string;
+    }): string {
+        const safePage = Number.isFinite(params.page) ? Math.max(1, Math.floor(params.page)) : 1;
+        const safePageSize = Number.isFinite(params.pageSize) ? Math.min(200, Math.max(1, Math.floor(params.pageSize))) : this.discoveryPageSize;
+        const base = `/api/virtuals?sort[0]=${params.sort}&pagination[page]=${safePage}&pagination[pageSize]=${safePageSize}`;
+
+        if (!params.factory) {
+            return base;
+        }
+        return `${base}&filters[factory][$eq]=${params.factory}`;
+    }
+
+    private parseTimestamp(value: string | null | undefined): number | null {
+        if (!value) {
+            return null;
+        }
+        const ts = Date.parse(value);
+        return Number.isNaN(ts) ? null : ts;
     }
 
     /**
@@ -122,10 +263,8 @@ export class VirtualsApi {
     }
 
     /**
-     * 选择监控目标
-     * 规则：
-     * 1. 优先：AVAILABLE + lpAddress 非空 + age <= maxProjectAge
-     * 2. 候补：最新 UNDERGRAD + preTokenPair 非空
+     * 选择监控目标：当前在打的 UNDERGRAD（如 ORION）
+     * 优先选「在税收窗口内」的（T0<=now<=T1）；若无则选「最近开打」的一个（T0 倒序）。T0=launchedAt ?? lpCreatedAt ?? createdAt
      */
     selectProject(agents: VirtualsAgent[]): SelectedProject | null {
         if (!agents || agents.length === 0) {
@@ -134,74 +273,58 @@ export class VirtualsApi {
         }
 
         const now = Date.now();
+        const windowMs = getTaxWindowMs();
 
-        // 按 lpCreatedAt 倒序排列
-        const sorted = [...agents].sort((a, b) => {
-            const timeA = a.lpCreatedAt ? new Date(a.lpCreatedAt).getTime() : 0;
-            const timeB = b.lpCreatedAt ? new Date(b.lpCreatedAt).getTime() : 0;
-            return timeB - timeA;
-        });
+        const undergrads = agents.filter(
+            (agent) =>
+                (agent.status?.toUpperCase?.() ?? '') === 'UNDERGRAD' &&
+                Boolean(agent.preTokenPair) &&
+                !agent.lpAddress
+        );
 
-        // 优先：最近上线的 AVAILABLE 项目
-        for (const agent of sorted) {
-            if (
-                agent.status === 'AVAILABLE' &&
-                agent.lpAddress &&
-                agent.tokenAddress &&
-                agent.lpCreatedAt
-            ) {
-                const lpTime = new Date(agent.lpCreatedAt).getTime();
-                const ageMinutes = (now - lpTime) / (60 * 1000);
+        const createdTs = (a: VirtualsAgent) => this.parseTimestamp(a.createdAt) ?? 0;
+        const lpCreatedTs = (a: VirtualsAgent) => this.parseTimestamp(a.lpCreatedAt);
+        const launchedTs = (a: VirtualsAgent) => this.parseTimestamp(a.launchedAt);
+        const t0For = (a: VirtualsAgent) => launchedTs(a) ?? lpCreatedTs(a) ?? createdTs(a);
 
-                if (ageMinutes <= this.maxProjectAge) {
-                    logger.info('Selected AVAILABLE project', {
-                        id: agent.id,
-                        name: agent.name,
-                        symbol: agent.symbol,
-                        ageMinutes: ageMinutes.toFixed(1),
-                        lpAddress: agent.lpAddress,
-                    });
-
-                    return {
-                        agent,
-                        poolAddress: agent.lpAddress,
-                        poolType: 'uniswap_v2',
-                        t0: new Date(agent.lpCreatedAt),
-                    };
-                }
-            }
+        const withT0: { agent: VirtualsAgent; t0: number }[] = [];
+        for (const agent of undergrads) {
+            const t0 = t0For(agent);
+            if (t0 <= 0) continue;
+            withT0.push({ agent, t0 });
         }
 
-        // 候补：最新的 UNDERGRAD 项目
-        for (const agent of sorted) {
-            if (agent.status === 'UNDERGRAD' && agent.preTokenPair) {
-                logger.info('Selected UNDERGRAD project (fallback)', {
-                    id: agent.id,
-                    name: agent.name,
-                    symbol: agent.symbol,
-                    preTokenPair: agent.preTokenPair,
-                });
-
-                return {
-                    agent,
-                    poolAddress: agent.preTokenPair,
-                    poolType: 'virtuals_curve',
-                    t0: new Date(), // 需要链上确认
-                };
-            }
+        if (withT0.length === 0) {
+            logger.debug('No UNDERGRAD with valid T0', { totalAgents: agents.length, undergradCount: undergrads.length });
+            return null;
         }
 
-        logger.debug('No suitable project found', {
-            totalAgents: agents.length,
-            availableCount: agents.filter(a => a.status === 'AVAILABLE').length,
-            undergradCount: agents.filter(a => a.status === 'UNDERGRAD').length,
+        const inWindow = withT0.filter(({ t0 }) => t0 <= now && now <= t0 + windowMs);
+        const list = inWindow.length > 0
+            ? inWindow.sort((a, b) => b.t0 - a.t0)
+            : withT0.sort((a, b) => b.t0 - a.t0);
+        const orion = list.find(({ agent }) => (agent.symbol?.toUpperCase?.() ?? '') === 'ORION');
+        const picked = orion ?? list[0];
+        const { agent: undergrad, t0 } = picked;
+
+        logger.info('Selected UNDERGRAD', {
+            id: undergrad.id,
+            name: undergrad.name,
+            symbol: undergrad.symbol,
+            inWindow: inWindow.length > 0,
+            t0: new Date(t0).toISOString(),
         });
 
-        return null;
+        return {
+            agent: undergrad,
+            poolAddress: undergrad.preTokenPair!,
+            poolType: 'virtuals_curve',
+            t0: new Date(t0),
+        };
     }
 
     /**
-     * 轮询发现项目
+     * 轮询发现项目：拉取两种排序并合并，确保当前在打的（如 ORION）能进列表
      */
     async discoverProject(
         onFound: (project: SelectedProject) => void,
@@ -212,11 +335,34 @@ export class VirtualsApi {
 
         while (!abortSignal?.aborted) {
             try {
-                const agents = await this.getLatestProjects();
+                logger.debug('Discover poll request', {
+                    endpoint: '/api/virtuals',
+                    page: this.discoveryPage,
+                    pageSize: this.discoveryPageSize,
+                });
+
+                const [byCreated, byLaunched] = await Promise.all([
+                    this.getLatestProjects(this.discoveryPage, this.discoveryPageSize),
+                    this.getProjectsBySort('launchedAt:desc', this.discoveryPage, this.discoveryPageSize),
+                ]);
+                const byId = new Map<number, VirtualsAgent>();
+                for (const a of [...byLaunched, ...byCreated]) {
+                    if (!byId.has(a.id)) byId.set(a.id, a);
+                }
+                const agents = Array.from(byId.values());
                 const selected = this.selectProject(agents);
 
                 if (selected) {
                     consecutiveErrors = 0;
+                    logger.info('Discover poll selected project', {
+                        projectId: selected.agent.id,
+                        symbol: selected.agent.symbol,
+                        status: selected.agent.status,
+                        poolType: selected.poolType,
+                        selectedT0: selected.t0.toISOString(),
+                        createdAt: selected.agent.createdAt,
+                        lpCreatedAt: selected.agent.lpCreatedAt,
+                    });
                     onFound(selected);
                     return;
                 }

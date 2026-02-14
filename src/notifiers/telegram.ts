@@ -16,17 +16,21 @@ interface QueuedMessage {
 export class TelegramNotifier {
     private baseUrl: string;
     private chatId: string;
+    private disabled: boolean;
     private throttleMap: Map<string, number> = new Map();
     private throttleMs: number = 60000;
     private sentHashes: LRUCache<string, boolean>;
     private messageQueue: QueuedMessage[] = [];
     private isProcessing: boolean = false;
-    private minInterval: number = 1000; // 最小发送间隔
+    private minInterval: number = 1000;
 
     constructor() {
         const config = getConfig();
-        this.baseUrl = `https://api.telegram.org/bot${config.telegram.botToken}`;
-        this.chatId = config.telegram.chatId;
+        const token = config.telegram?.botToken?.trim();
+        const chat = config.telegram?.chatId?.trim();
+        this.disabled = !token || !chat;
+        this.baseUrl = token ? `https://api.telegram.org/bot${token}` : '';
+        this.chatId = chat || '';
         this.sentHashes = new LRUCache(500);
     }
 
@@ -34,6 +38,7 @@ export class TelegramNotifier {
      * 发送消息（内部）
      */
     private async sendImmediate(message: string): Promise<void> {
+        if (this.disabled) return;
         try {
             const response = await fetch(`${this.baseUrl}/sendMessage`, {
                 method: 'POST',
@@ -252,6 +257,7 @@ Time: ${new Date().toISOString()}
      * 测试连接
      */
     async testConnection(): Promise<boolean> {
+        if (this.disabled) return false;
         try {
             const response = await fetch(`${this.baseUrl}/getMe`);
             return response.ok;

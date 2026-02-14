@@ -8,6 +8,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { logger } from '../utils/index.js';
 import { getConfig } from '../config.js';
 import { getRpcPool } from './rpc-pool.js';
+import { getVirtualsApi } from './virtuals-api.js';
 import { State, StateMachineContext, WhaleTradeInfo, TaxResult, BuybackStatus, VirtualsAgent } from '../types.js';
 
 // 事件类型
@@ -34,6 +35,22 @@ export interface ApiState {
     taxTotal: string;
     elapsedMinutes: number;
     remainingMinutes: number;
+    startBalance: string | null;
+    onchainFdvVirtual: string | null;
+    onchainFdvUsd: string | null;
+    apiFdvVirtual: string | null;
+    apiFdvUsd: string | null;
+    tax: {
+        netInflow: string;
+        balanceDiff: string;
+    } | null;
+    buyback: {
+        spentTotal: string;
+        progress: number;
+        etaHours: number;
+        ratePerHour: number;
+        lastTxAmount: string | null;
+    } | null;
 }
 
 export class ApiServer {
@@ -50,9 +67,14 @@ export class ApiServer {
     private t0: Date | null = null;
     private t1: Date | null = null;
     private taxTotal: bigint = 0n;
+    private startBalance: bigint | null = null;
     private lastTaxResult: TaxResult | null = null;
     private lastBuybackStatus: BuybackStatus | null = null;
     private tradeHistory: WhaleTradeInfo[] = [];
+    private onchainFdvVirtual: string | null = null;
+    private onchainFdvUsd: string | null = null;
+    private apiFdvVirtual: string | null = null;
+    private apiFdvUsd: string | null = null;
 
     constructor(port: number = 4000) {
         this.port = port;
@@ -69,6 +91,14 @@ export class ApiServer {
         this.t0 = context.t0;
         this.t1 = context.t1;
         this.taxTotal = context.taxTotal;
+        this.startBalance = context.startBalance ?? null;
+
+        if (stateChanged && (context.state === State.DISCOVER || context.project == null)) {
+            this.onchainFdvVirtual = null;
+            this.onchainFdvUsd = null;
+            this.apiFdvVirtual = null;
+            this.apiFdvUsd = null;
+        }
 
         if (stateChanged) {
             this.broadcast({
@@ -119,9 +149,16 @@ export class ApiServer {
         });
     }
 
-    /**
-     * 更新回购数据
-     */
+    updateOnchainFdv(fdvVirtual: string, fdvUsd: string | null): void {
+        this.onchainFdvVirtual = fdvVirtual;
+        this.onchainFdvUsd = fdvUsd;
+    }
+
+    updateApiFdv(fdvVirtual: string | null, fdvUsd: string | null): void {
+        this.apiFdvVirtual = fdvVirtual;
+        this.apiFdvUsd = fdvUsd;
+    }
+
     updateBuyback(status: BuybackStatus): void {
         this.lastBuybackStatus = status;
 
@@ -152,8 +189,24 @@ export class ApiServer {
             t0: this.t0?.toISOString() || null,
             t1: this.t1?.toISOString() || null,
             taxTotal: this.taxTotal.toString(),
+            startBalance: this.startBalance !== null ? this.startBalance.toString() : null,
             elapsedMinutes,
             remainingMinutes,
+            tax: this.lastTaxResult ? {
+                netInflow: this.lastTaxResult.netInflow.toString(),
+                balanceDiff: this.lastTaxResult.balanceDiff.toString(),
+            } : null,
+            buyback: this.lastBuybackStatus ? {
+                spentTotal: this.lastBuybackStatus.spentTotal.toString(),
+                progress: this.lastBuybackStatus.progress,
+                etaHours: this.lastBuybackStatus.etaHours,
+                ratePerHour: this.lastBuybackStatus.ratePerHour,
+                lastTxAmount: this.lastBuybackStatus.lastTxAmount !== null ? this.lastBuybackStatus.lastTxAmount.toString() : null,
+            } : null,
+            onchainFdvVirtual: this.onchainFdvVirtual,
+            onchainFdvUsd: this.onchainFdvUsd,
+            apiFdvVirtual: this.apiFdvVirtual,
+            apiFdvUsd: this.apiFdvUsd,
         };
     }
 
@@ -197,18 +250,7 @@ export class ApiServer {
             if (req.method === 'GET' && url === '/api/state') {
                 // 当前状态
                 res.writeHead(200, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({
-                    ...this.getStateSnapshot(),
-                    tax: this.lastTaxResult ? {
-                        netInflow: this.lastTaxResult.netInflow.toString(),
-                        balanceDiff: this.lastTaxResult.balanceDiff.toString(),
-                    } : null,
-                    buyback: this.lastBuybackStatus ? {
-                        spentTotal: this.lastBuybackStatus.spentTotal.toString(),
-                        progress: this.lastBuybackStatus.progress,
-                        etaHours: this.lastBuybackStatus.etaHours,
-                    } : null,
-                }));
+                res.end(JSON.stringify(this.getStateSnapshot()));
             } else if (req.method === 'GET' && url === '/api/trades') {
                 // 交易历史
                 res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -240,6 +282,24 @@ export class ApiServer {
                 const health = await rpcPool.healthCheck();
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify(health));
+            } else if (req.method === 'GET' && url === '/api/upcoming-launches') {
+                const virtualsApi = getVirtualsApi();
+                const launches = await virtualsApi.getUpcomingLaunches(100);
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify(launches.map((item) => ({
+                    id: item.id,
+                    name: item.name,
+                    symbol: item.symbol,
+                    status: item.status,
+                    factory: item.factory,
+                    createdAt: item.createdAt,
+                    launchedAt: item.launchedAt,
+                    preTokenPair: item.preTokenPair,
+                    image: item.image,
+                    source: item.factory === 'VIBES_BONDING_V2' ? '60_days' : 'unicorn',
+                    mcapInVirtual: item.mcapInVirtual,
+                    liquidityUsd: item.liquidityUsd,
+                }))));
             } else {
                 res.writeHead(404, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ error: 'Not Found' }));

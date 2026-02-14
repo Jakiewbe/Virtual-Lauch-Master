@@ -49,15 +49,33 @@ export class TaxTracker {
         this.blockStart = await timeToBlock(provider, t0.getTime());
         this.lastProcessedBlock = this.blockStart;
 
-        // 获取初始余额并缓存
-        this.startBalance = await this.virtualToken.balanceOf(this.buybackAddr, {
-            blockTag: this.blockStart,
-        });
+        try {
+            this.startBalance = await this.virtualToken.balanceOf(this.buybackAddr, {
+                blockTag: this.blockStart,
+            });
+        } catch (e) {
+            logger.warn('TaxTracker init: balanceOf at blockStart failed, retrying once', {
+                blockStart: this.blockStart,
+                error: String(e),
+            });
+            try {
+                this.startBalance = await this.virtualToken.balanceOf(this.buybackAddr, {
+                    blockTag: this.blockStart,
+                });
+            } catch {
+                this.startBalance = 0n;
+                logger.warn('TaxTracker init: using startBalance 0, netInflow only', { blockStart: this.blockStart });
+            }
+        }
 
         logger.info('TaxTracker initialized', {
             blockStart: this.blockStart,
             initialBalance: ethers.formatEther(this.startBalance),
         });
+    }
+
+    getStartBalance(): bigint {
+        return this.startBalance;
     }
 
     /**
@@ -90,7 +108,10 @@ export class TaxTracker {
             let outflowDelta = 0n;
 
             for (const log of logs) {
-                const [from, to, value] = log.args as [string, string, bigint];
+                if (!('args' in log) || !log.args) {
+                    continue;
+                }
+                const [from, to, value] = log.args as unknown as [string, string, bigint];
 
                 if (to.toLowerCase() === this.buybackAddr) {
                     inflowDelta += value;

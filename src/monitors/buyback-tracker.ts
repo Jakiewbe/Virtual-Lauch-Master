@@ -131,6 +131,7 @@ export class BuybackTracker {
                 ? Number((this.spentTotal * 10000n) / this.taxTotal) / 100
                 : 0;
 
+        const lastRecord = this.spentHistory.length > 0 ? this.spentHistory[this.spentHistory.length - 1] : null;
         return {
             spentTotal: this.spentTotal,
             spentWindow,
@@ -138,6 +139,7 @@ export class BuybackTracker {
             remaining,
             etaHours,
             progress,
+            lastTxAmount: lastRecord ? lastRecord.amount : null,
         };
     }
 

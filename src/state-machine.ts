@@ -5,8 +5,9 @@
 
 import { logger, sleep } from './utils/index.js';
 import { getConfig } from './config.js';
-import { getVirtualsApi, getHealthServer } from './providers/index.js';
+import { getVirtualsApi, getHealthServer, getApiServer, getRpcPool } from './providers/index.js';
 import { TaxTracker, BuybackTracker, WhaleTrades } from './monitors/index.js';
+import { computeCurveFdv, getVirtualPriceUsd } from './services/fdv-calculator.js';
 import { getTelegramNotifier } from './notifiers/index.js';
 import { State, SelectedProject, StateMachineContext } from './types.js';
 
@@ -17,6 +18,7 @@ export class StateMachine {
         t0: null,
         t1: null,
         taxTotal: 0n,
+        startBalance: null,
         lastTaxUpdate: null,
         lastBuybackUpdate: null,
     };
@@ -26,6 +28,8 @@ export class StateMachine {
     private whaleTrades: WhaleTrades | null = null;
     private abortController: AbortController = new AbortController();
     private tickCount: number = 0;
+    private lastProjectStatusCheck: Date | null = null;
+    private readonly projectStatusCheckIntervalMs = 60 * 1000;
 
     /**
      * 启动状态机
@@ -77,6 +81,14 @@ export class StateMachine {
         }
     }
 
+    private updateApiStatus(): void {
+        try {
+            const apiServer = getApiServer();
+            apiServer.updateContext(this.context);
+        } catch {
+        }
+    }
+
     /**
      * 处理错误
      */
@@ -103,6 +115,7 @@ export class StateMachine {
 
         // 更新健康状态
         this.updateHealthStatus();
+        this.updateApiStatus();
 
         switch (this.context.state) {
             case State.DISCOVER:
@@ -134,6 +147,7 @@ export class StateMachine {
                 this.context.project = project;
                 this.context.t0 = project.t0;
                 this.context.t1 = new Date(project.t0.getTime() + getConfig().thresholds.taxWindowMinutes * 60 * 1000);
+                this.lastProjectStatusCheck = null;
                 this.transition(State.WAIT_T0);
             },
             this.abortController.signal
@@ -164,10 +178,12 @@ export class StateMachine {
         // 初始化税收追踪器
         this.taxTracker = new TaxTracker();
         await this.taxTracker.init(this.context.t0!);
+        this.context.startBalance = this.taxTracker.getStartBalance();
 
         // 初始化大额交易监控器
         this.whaleTrades = new WhaleTrades(project.poolAddress, project.poolType);
         await this.whaleTrades.start((trade) => {
+            getApiServer().recordTrade(trade);
             notifier.sendWhaleTrade(trade, project.agent);
         });
 
@@ -200,20 +216,69 @@ export class StateMachine {
             const notifier = getTelegramNotifier();
             const elapsedMinutes = getConfig().thresholds.taxWindowMinutes;
             await notifier.sendTaxProgress(result, this.context.project.agent, elapsedMinutes);
+            getApiServer().updateTax(result, elapsedMinutes);
 
             this.transition(State.BUYBACK_PHASE);
             return;
         }
 
-        // 每 5 分钟更新一次税收
         const taxUpdateInterval = 5 * 60 * 1000;
         if (!this.context.lastTaxUpdate || now - this.context.lastTaxUpdate.getTime() >= taxUpdateInterval) {
+            const provider = getRpcPool().getHttpProvider();
+            let latestBlock = await provider.getBlockNumber();
+            let progress = this.taxTracker.getProgress();
+            const maxCatchUpRounds = 10;
+            let rounds = 0;
+            while (latestBlock - progress.currentBlock > 2000 && rounds < maxCatchUpRounds) {
+                await this.taxTracker.update();
+                progress = this.taxTracker.getProgress();
+                latestBlock = await provider.getBlockNumber();
+                rounds++;
+            }
             const result = await this.taxTracker.update();
             this.context.lastTaxUpdate = new Date();
-
             const elapsedMinutes = (now - this.context.t0!.getTime()) / (60 * 1000);
+            getApiServer().updateTax(result, elapsedMinutes);
             const notifier = getTelegramNotifier();
             await notifier.sendTaxProgress(result, this.context.project.agent, elapsedMinutes);
+        }
+
+        if (this.context.project.poolType === 'virtuals_curve') {
+            const tokenAddr = this.context.project.agent.preToken ?? this.context.project.agent.tokenAddress ?? null;
+            const fdv = await computeCurveFdv(this.context.project.poolAddress, tokenAddr);
+            if (fdv) {
+                getApiServer().updateOnchainFdv(fdv.fdvInVirtual, fdv.fdvUsd);
+                getApiServer().updateApiFdv(null, null);
+            } else {
+                try {
+                    const api = getVirtualsApi();
+                    const fresh = await api.getProjectById(this.context.project.agent.id);
+                    if (fresh && (fresh.mcapInVirtual != null || fresh.virtualTokenValue)) {
+                        const apiFdvVirtual = fresh.virtualTokenValue ?? String(fresh.mcapInVirtual ?? 0);
+                        const usdPerVirtual = await getVirtualPriceUsd();
+                        const apiFdvUsd = usdPerVirtual != null && usdPerVirtual > 0 && fresh.mcapInVirtual != null
+                            ? (fresh.mcapInVirtual * usdPerVirtual).toFixed(2)
+                            : null;
+                        getApiServer().updateApiFdv(apiFdvVirtual, apiFdvUsd);
+                    }
+                } catch {
+                    getApiServer().updateApiFdv(null, null);
+                }
+            }
+        }
+
+        if (!this.lastProjectStatusCheck || now - this.lastProjectStatusCheck.getTime() >= this.projectStatusCheckIntervalMs) {
+            this.lastProjectStatusCheck = new Date();
+            const api = getVirtualsApi();
+            try {
+                const fresh = await api.getProjectById(this.context.project.agent.id);
+                if (fresh && (fresh.status === 'AVAILABLE' || Boolean(fresh.lpAddress))) {
+                    logger.info('Project graduated, ending monitoring', { symbol: this.context.project.agent.symbol });
+                    this.transition(State.DONE);
+                }
+            } catch {
+                // ignore fetch error, keep current project
+            }
         }
     }
 
@@ -242,16 +307,30 @@ export class StateMachine {
             return;
         }
 
-        // 每 10 分钟更新一次状态
         const now = Date.now();
+        if (!this.lastProjectStatusCheck || now - this.lastProjectStatusCheck.getTime() >= this.projectStatusCheckIntervalMs) {
+            this.lastProjectStatusCheck = new Date();
+            const api = getVirtualsApi();
+            try {
+                const fresh = await api.getProjectById(this.context.project.agent.id);
+                if (fresh && (fresh.status === 'AVAILABLE' || Boolean(fresh.lpAddress))) {
+                    logger.info('Project graduated during buyback, ending monitoring', { symbol: this.context.project.agent.symbol });
+                    this.transition(State.DONE);
+                    return;
+                }
+            } catch {
+                // ignore
+            }
+        }
+
         const buybackUpdateInterval = 10 * 60 * 1000;
         if (!this.context.lastBuybackUpdate || now - this.context.lastBuybackUpdate.getTime() >= buybackUpdateInterval) {
             const status = this.buybackTracker.getStatus();
             this.context.lastBuybackUpdate = new Date();
 
             await notifier.sendBuybackStatus(status, this.context.project.agent);
+            getApiServer().updateBuyback(status);
 
-            // 检查停滞
             this.buybackTracker.checkStall();
         }
     }
@@ -268,6 +347,7 @@ export class StateMachine {
 
         const notifier = getTelegramNotifier();
         const status = this.buybackTracker.getStatus();
+        getApiServer().updateBuyback(status);
 
         await notifier.sendComplete(this.context.project.agent, status);
 
@@ -286,6 +366,7 @@ export class StateMachine {
             t0: null,
             t1: null,
             taxTotal: 0n,
+            startBalance: null,
             lastTaxUpdate: null,
             lastBuybackUpdate: null,
         };
@@ -300,9 +381,13 @@ export class StateMachine {
             to: newState,
         });
         this.context.state = newState;
+        if (newState === State.DISCOVER) {
+            this.context.startBalance = null;
+        }
 
         // 立即更新健康状态
         this.updateHealthStatus();
+        this.updateApiStatus();
     }
 
     /**
